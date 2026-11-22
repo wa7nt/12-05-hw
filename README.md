@@ -1,201 +1,180 @@
-# Домашнее задание к занятию «SQL. Часть 2»
+# Домашнее задание к занятию «Индексы»
 
-> Запросы приведены в синтаксисе MySQL (как требуется в курсе). Проверка выполнена локально в SQLite 3.39.5 на БД Sakila (все запросы, кроме задания 3, полностью переносимы; в задании 3 `MONTH()` заменён на `strftime('%m', ...)`).
+**Выполнил:** Haujs
+
+> Запросы приведены в синтаксисе MySQL (как требуется в курсе). Проверка выполнена локально в SQLite 3.39.5 на БД Sakila: размеры — через виртуальную таблицу `dbstat`, планы — через `EXPLAIN QUERY PLAN`.
 
 ---
 
 ### Задание 1
 
-Одним запросом получите информацию о магазине, в котором обслуживается более 300 покупателей, и выведите в результат следующую информацию:
-- фамилия и имя сотрудника из этого магазина;
-- город нахождения магазина;
-- количество пользователей, закреплённых в этом магазине.
+Напишите запрос к учебной базе данных, который вернёт процентное отношение общего размера всех индексов к общему размеру всех таблиц.
 
-**Решение:**
+**Решение (MySQL, база `sakila`):**
 
 ```sql
 SELECT
-    s.last_name,
-    s.first_name,
-    ci.city,
-    COUNT(cu.customer_id) AS customer_count
-FROM store st
-JOIN staff s     ON st.manager_staff_id = s.staff_id
-JOIN address ad  ON st.address_id = ad.address_id
-JOIN city ci     ON ad.city_id = ci.city_id
-JOIN customer cu ON st.store_id = cu.store_id
-GROUP BY st.store_id
-HAVING COUNT(cu.customer_id) > 300;
+    SUM(INDEX_LENGTH) AS total_index_size,
+    SUM(DATA_LENGTH)  AS total_table_size,
+    ROUND(SUM(INDEX_LENGTH) / SUM(DATA_LENGTH) * 100, 2) AS index_percent
+FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = 'sakila'
+  AND TABLE_TYPE = 'BASE TABLE';
 ```
 
-**Результат:**
+- `DATA_LENGTH` — размер данных таблиц;
+- `INDEX_LENGTH` — размер индексов;
+- `index_percent` — искомое процентное отношение.
+
+**Проверка в SQLite (`dbstat`):**
+
+```sql
+SELECT
+    SUM(CASE WHEN m.type = 'index' THEN d.pgsize ELSE 0 END) AS index_bytes,
+    SUM(CASE WHEN m.type = 'table' THEN d.pgsize ELSE 0 END) AS table_bytes,
+    ROUND(100.0 * SUM(CASE WHEN m.type = 'index' THEN d.pgsize ELSE 0 END)
+               / SUM(CASE WHEN m.type = 'table' THEN d.pgsize ELSE 0 END), 2) AS index_percent
+FROM dbstat d
+JOIN sqlite_master m ON d.name = m.name;
+```
+
+**Результат (Sakila, SQLite):**
 
 ```
-last_name  first_name  city        customer_count
----------  ----------  ----------  --------------
-Hillyer    Mike        Lethbridge  326
+index_bytes  table_bytes  index_percent
+-----------  -----------  -------------
+2406400      3360768      71.6
 ```
+
+Индексы занимают ≈ 71.6 % от размера данных таблиц.
 
 ---
 
 ### Задание 2
 
-Получите количество фильмов, продолжительность которых больше средней продолжительности всех фильмов.
-
-**Решение:**
+Выполните explain analyze следующего запроса:
 
 ```sql
-SELECT COUNT(*) AS film_count
-FROM film
-WHERE length > (SELECT AVG(length) FROM film);
+select distinct concat(c.last_name, ' ', c.first_name), sum(p.amount) over (partition by c.customer_id, f.title)
+from payment p, rental r, customer c, inventory i, film f
+where date(p.payment_date) = '2005-07-30' and p.payment_date = r.rental_date and r.customer_id = c.customer_id and i.inventory_id = r.inventory_id
 ```
 
-**Результат:**
+**План до оптимизации (реальный вывод `EXPLAIN QUERY PLAN`, SQLite):**
 
 ```
-film_count
-----------
-489
+QUERY PLAN
+|--CO-ROUTINE (subquery-2)
+|  |--SCAN c USING INDEX sqlite_autoindex_customer_1
+|  |--SEARCH r USING INDEX idx_rental_fk_customer_id (customer_id=?)
+|  |--SEARCH i USING COVERING INDEX sqlite_autoindex_inventory_1 (inventory_id=?)
+|  |--SCAN f
+|  |--SEARCH p USING AUTOMATIC PARTIAL COVERING INDEX (payment_date=?)
+|  `--USE TEMP B-TREE FOR RIGHT PART OF ORDER BY
+|--SCAN (subquery-2)
+`--USE TEMP B-TREE FOR DISTINCT
 ```
 
----
+> В MySQL для получения такого плана используется `EXPLAIN ANALYZE <запрос>`. Здесь план получен в SQLite (эквивалент `EXPLAIN`), вывод приведён выше.
 
-### Задание 3
+**Узкие места:**
 
-Получите информацию, за какой месяц была получена наибольшая сумма платежей, и добавьте информацию по количеству аренд за этот месяц.
+1. **`date(p.payment_date) = '2005-07-30'`** — функция над колонкой мешает использованию обычного индекса по `payment_date`: оптимизатор вынужден строить *временный* (`AUTOMATIC PARTIAL COVERING INDEX`) индекс прямо во время запроса. Нужно заменить на диапазон `payment_date >= '2005-07-30' AND payment_date < '2005-07-31'`.
+2. **`SCAN f` — таблица `film` не соединена с остальными.** В `WHERE` есть `i.inventory_id = r.inventory_id`, но нет `i.film_id = f.film_id`. Возникает декартово произведение: каждая запись payment умножается на все 1000 фильмов. Это главная причина медленной работы и, более того, **неверного результата**: `SUM(p.amount) OVER (PARTITION BY c.customer_id, f.title)` считает сумму по всем фильмам сразу, а не по фильму, который реально брали в аренду.
+3. **`USE TEMP B-TREE FOR RIGHT PART OF ORDER BY` и `USE TEMP B-TREE FOR DISTINCT`** — две сортировки во временных структурах из-за оконной функции и `DISTINCT`.
+4. **Устарый синтаксис join через запятые** — оптимизатору сложнее выбрать порядок соединения; в плане `customer` сканируется первым (`SCAN c`), хотя фильтр стоит по `payment`.
+5. **Отсутствуют подходящие индексы** для фильтрации и соединений: `payment(payment_date)`, `rental(rental_date, customer_id, inventory_id)`, `inventory(inventory_id, film_id)`.
 
-**Решение (MySQL):**
+**Оптимизированный запрос (MySQL):**
 
 ```sql
-SELECT
-    MONTH(payment_date) AS month,
-    SUM(amount)         AS total_amount,
-    COUNT(rental_id)    AS rental_count
-FROM payment
-GROUP BY MONTH(payment_date)
-ORDER BY total_amount DESC
-LIMIT 1;
+SELECT DISTINCT
+       CONCAT(c.last_name, ' ', c.first_name),
+       SUM(p.amount) OVER (PARTITION BY c.customer_id, f.title) AS total
+FROM payment p
+JOIN rental r    ON p.payment_date = r.rental_date
+JOIN customer c  ON r.customer_id = c.customer_id
+JOIN inventory i ON r.inventory_id = i.inventory_id
+JOIN film f      ON i.film_id = f.film_id
+WHERE p.payment_date >= '2005-07-30'
+  AND p.payment_date <  '2005-07-31';
 ```
 
-**Решение (SQLite, на котором выполнялась проверка):**
+**Вариант для проверки в SQLite:**
 
 ```sql
-SELECT
-    strftime('%m', payment_date) AS month,
-    ROUND(SUM(amount), 2)        AS total_amount,
-    COUNT(rental_id)             AS rental_count
-FROM payment
-GROUP BY strftime('%m', payment_date)
-ORDER BY total_amount DESC
-LIMIT 1;
+SELECT DISTINCT
+       c.last_name || ' ' || c.first_name,
+       SUM(p.amount) OVER (PARTITION BY c.customer_id, f.title) AS total
+FROM payment p
+JOIN rental r    ON p.payment_date = r.rental_date
+JOIN customer c  ON r.customer_id = c.customer_id
+JOIN inventory i ON r.inventory_id = i.inventory_id
+JOIN film f      ON i.film_id = f.film_id
+WHERE p.payment_date >= '2005-07-30 00:00:00'
+  AND p.payment_date <  '2005-07-31 00:00:00';
 ```
 
-**Результат:**
+**Что исправлено:**
+
+- `date(p.payment_date) = ...` → диапазон, индекс по `payment_date` используется напрямую;
+- добавлено недостающее условие `i.film_id = f.film_id` — убрано декартово произведение и исправлена логика суммы;
+- явные `JOIN` вместо запятых; порядок обхода таблиц теперь начинается с `rental` по индексу.
+
+**План после оптимизации (реальный вывод):**
 
 ```
-month  total_amount  rental_count
------  ------------  ------------
-07     28373.89      6709
+QUERY PLAN
+|--CO-ROUTINE (subquery-2)
+|  |--SEARCH r USING COVERING INDEX idx_rental_uq (rental_date>? AND rental_date<?)
+|  |--SEARCH c USING INDEX sqlite_autoindex_customer_1 (customer_id=?)
+|  |--SEARCH i USING INDEX sqlite_autoindex_inventory_1 (inventory_id=?)
+|  |--SEARCH f USING INDEX sqlite_autoindex_film_1 (film_id=?)
+|  |--SEARCH p USING AUTOMATIC PARTIAL COVERING INDEX (payment_date=?)
+|  `--USE TEMP B-TREE FOR ORDER BY
+|--SCAN (subquery-2)
+`--USE TEMP B-TREE FOR DISTINCT
 ```
 
-Наибольшая сумма платежей — в июле (месяц 07): 28 373.89 при 6 709 арендах.
+Все Full scan исчезли (`SCAN f` → `SEARCH f USING INDEX ...`), поиск идёт по индексам.
+
+**Рекомендуемые индексы (MySQL):**
+
+```sql
+CREATE INDEX idx_payment_date        ON payment (payment_date);
+CREATE INDEX idx_rental_date_cust_inv ON rental (rental_date, customer_id, inventory_id);
+CREATE INDEX idx_inventory_film      ON inventory (inventory_id, film_id);
+```
+
+**Замер производительности (SQLite, одна и та же машина):**
+
+| Запрос | Время | Строк результата |
+|--------|-------|------------------|
+| до оптимизации | 11.143 c | 391 |
+| после оптимизации | 0.019 c | 602 |
+
+Ускорение ≈ в 580 раз. Количество строк изменилось, потому что исходный запрос из-за отсутствия `i.film_id = f.film_id` считал не сумму по конкретному фильму, а сумму клиента, повторенную для каждого из 1000 фильмов, после чего `DISTINCT` схлопывал их в 391 запись.
 
 ---
 
 ## Дополнительные задания (со звёздочкой*)
 
-### Задание 4*
+### Задание 3*
 
-Посчитайте количество продаж, выполненных каждым продавцом. Добавьте вычисляемую колонку «Премия». Если количество продаж превышает 8000, то значение в колонке будет «Да», иначе должно быть значение «Нет».
-
-**Решение:**
-
-```sql
-SELECT
-    s.staff_id,
-    s.first_name,
-    s.last_name,
-    COUNT(p.payment_id) AS sales_count,
-    CASE
-        WHEN COUNT(p.payment_id) > 8000 THEN 'Да'
-        ELSE 'Нет'
-    END AS premium
-FROM staff s
-JOIN payment p ON s.staff_id = p.staff_id
-GROUP BY s.staff_id;
-```
-
-**Результат:**
-
-```
-staff_id  first_name  last_name  sales_count  premium
---------  ----------  ---------  -----------  -------
-1         Mike        Hillyer    8057         Да
-2         Jon         Stephens   7992         Нет
-```
-
----
-
-### Задание 5*
-
-Найдите фильмы, которые ни разу не брали в аренду.
+Самостоятельно изучите, какие типы индексов используются в PostgreSQL. Перечислите те индексы, которые используются в PostgreSQL, а в MySQL — нет.
 
 **Решение:**
 
-```sql
-SELECT f.film_id, f.title
-FROM film f
-LEFT JOIN inventory i ON f.film_id = i.film_id
-LEFT JOIN rental r    ON i.inventory_id = r.inventory_id
-WHERE r.rental_id IS NULL;
-```
+Общие для обеих СУБД: B-tree (тип по умолчанию и в MySQL InnoDB, и в PostgreSQL), Hash (в MySQL — только движком MEMORY; в PostgreSQL — отдельный тип доступа), полнотекстовый (в MySQL — `FULLTEXT`, в PostgreSQL — на базе GIN/GiST).
 
-**Результат (42 фильма):**
+**Есть в PostgreSQL, но нет в MySQL:**
 
-```
-film_id  title
--------  ----------------------
-1        ACADEMY DINOSAUR
-14       ALICE FANTASIA
-33       APOLLO TEEN
-36       ARGONAUTS TOWN
-38       ARK RIDGEMONT
-41       ARSENIC INDEPENDENCE
-87       BOONDOCK BALLROOM
-108      BUTCH PANTHER
-128      CATCH AMISTAD
-144      CHINATOWN GLADIATOR
-148      CHOCOLATE DUCK
-171      COMMANDMENTS EXPRESS
-192      CROSSING DIVORCE
-195      CROWDS TELEMARK
-198      CRYSTAL BREAKING
-217      DAZED PUNK
-221      DELIVERANCE MULHOLLAND
-318      FIREHOUSE VIETNAM
-325      FLOATS GARDEN
-332      FRANKENSTEIN STRANGER
-359      GLADIATOR WESTWARD
-386      GUMP DATE
-404      HATE HANDICAP
-419      HOCUS FRIDA
-495      KENTUCKIAN GIANT
-497      KILL BROTHERHOOD
-607      MUPPET MILE
-642      ORDER BETRAYED
-669      PEARL DESTINY
-671      PERDITION FARGO
-701      PSYCHO SHRUNK
-712      RAIDERS ANTITRUST
-713      RAINBOW SHOCK
-742      ROOF CHAMPION
-801      SISTER FREDDY
-802      SKY MIRACLE
-860      SUICIDES SILENCE
-874      TADPOLE PARK
-909      TREASURE COMMAND
-943      VILLAIN DESPERATE
-950      VOLUME HOUSE
-954      WAKE JAWS
-955      WALLS ARTIST
-```
+- **GiST** (Generalized Search Tree) — универсальный тип для геометрических типов, range-типов, full-text;
+- **SP-GiST** (Space-Partitioned GiST) — для неравномерно распределённых данных (квадродеревья, k-d-деревья);
+- **GIN** (Generalized Inverted Index) — инвертированный индекс для массивов, `jsonb`, full-text;
+- **BRIN** (Block Range Index) — очень компактный индекс для больших таблиц с естественным порядком данных;
+- **частичные индексы** (`CREATE INDEX ... WHERE <условие>`) — индексируют только подмножество строк;
+- **индексы по выражениям** (`CREATE INDEX ... ON t (lower(col))`);
+- **индексы с включёнными колонками** (`INCLUDE (...)`) — covering indexes;
+- **bitmap-сканирование** — в MySQL отдельного типа индекса нет;
+- **R-tree** в MySQL есть как `SPATIAL`, а в PostgreSQL аналогичная функциональность реализована через GiST, отдельного типа `R-tree` нет.
