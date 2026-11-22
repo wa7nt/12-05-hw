@@ -178,3 +178,13 @@ CREATE INDEX idx_inventory_film      ON inventory (inventory_id, film_id);
 - **индексы с включёнными колонками** (`INCLUDE (...)`) — covering indexes;
 - **bitmap-сканирование** — в MySQL отдельного типа индекса нет;
 - **R-tree** в MySQL есть как `SPATIAL`, а в PostgreSQL аналогичная функциональность реализована через GiST, отдельного типа `R-tree` нет.
+
+---
+
+## Код
+
+- [`sql/task1.sql`](sql/task1.sql) — запрос MySQL к `information_schema` (задание 1);
+- [`sql/task1_sqlite.sql`](sql/task1_sqlite.sql) — проверка размера индексов через `dbstat` в SQLite;
+- [`sql/task2_explain.sql`](sql/task2_explain.sql) — исходный запрос с `EXPLAIN ANALYZE`;
+- [`sql/task2_optimized.sql`](sql/task2_optimized.sql) — оптимизированный запрос + `CREATE INDEX`;
+- [`sql/task2_sqlite.sql`](sql/task2_sqlite.sql) — планы до/после оптимизации в SQLite.
